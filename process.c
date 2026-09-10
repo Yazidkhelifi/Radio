@@ -8,6 +8,9 @@
 #include "sl_flex_rail_package_assistant.h"
 #include "sl_flex_rail_config.h"
 #include "sl_flex_rail_channel_selector.h"
+#include "sl_sleeptimer.h"
+#include "sl_udelay.h"
+
 
 #if defined(SL_CATALOG_KERNEL_PRESENT)
 #include "app_task_init.h"
@@ -90,6 +93,8 @@ void app_process_action(RAIL_Handle_t rail_handle)
         if (packet_size > 0 && start_of_packet != NULL) {
           if (start_of_packet[0] == 0x01) {
             sl_led_toggle(&sl_led_led0);
+            sl_udelay_wait(500000U);
+            sl_led_toggle(&sl_led_led0);
 
           }
         }
@@ -104,7 +109,6 @@ void app_process_action(RAIL_Handle_t rail_handle)
           sl_rail_simple_cpc_transmit(packet_size, start_of_packet);
 #endif
         }
-        //toggle_receive_led();
         rx_packet_handle = RAIL_GetRxPacketInfo(rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST_COMPLETE, &packet_info);
       }
       state = S_IDLE;
@@ -115,8 +119,7 @@ void app_process_action(RAIL_Handle_t rail_handle)
 #if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
       sl_rail_simple_cpc_transmit(1, &success_sent);
 #endif
-      //toggle_send_led();
-     // RAIL_StartRx(rail_handle, get_selected_channel(), NULL);
+
       state = S_IDLE;
       break;
 
@@ -133,7 +136,7 @@ void app_process_action(RAIL_Handle_t rail_handle)
     case S_IDLE:
       if (tx_requested) {
         prepare_package(rail_handle, out_packet, sizeof(out_packet));
-        rail_status = RAIL_StartTx(rail_handle, get_selected_channel(), RAIL_TX_OPTIONS_DEFAULT, NULL);
+        rail_status = RAIL_StartTx(rail_handle, 1, RAIL_TX_OPTIONS_DEFAULT, NULL);
         if (rail_status != RAIL_STATUS_NO_ERROR) {
           app_log_warning("RAIL_StartTx() result:%d ", rail_status);
         }
