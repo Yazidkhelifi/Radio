@@ -1,0 +1,371 @@
+#include <stdint.h>
+#include <string.h>
+#include "sl_component_catalog.h"
+#include "simple_rail_assistance.h"
+#include "rail.h"
+#include "app_process.h"
+#include "sl_simple_button_instances.h"
+#include "sl_simple_led_instances.h"
+#include "sl_flex_rail_package_assistant.h"
+#include "sl_flex_rail_config.h"
+#include "sl_flex_rail_channel_selector.h"
+#include "sl_sleeptimer.h"
+#include "sl_udelay.h"
+#include "sl_se_manager.h"
+#include "sl_se_manager_cipher.h"
+
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+#include "app_task_init.h"
+#endif
+
+#include "rail_types.h"
+#include "cmsis_compiler.h"
+
+#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
+#include "sl_rail_simple_cpc.h"
+#endif
+
+// -----------------------------------------------------------------------------
+//                              AES-CCM-96 config
+// -----------------------------------------------------------------------------
+#define PLAINTEXT_LEN   (16U)
+#define COUNTER_LEN     (4U)
+#define CCM_TAG_LEN     (12U)
+#define CCM_NONCE_LEN   (13U)
+#define FRAME_LEN       (COUNTER_LEN + PLAINTEXT_LEN + CCM_TAG_LEN)
+
+#define TX_PAYLOAD_LENGTH (PLAINTEXT_LEN)
+
+typedef enum {
+  S_PACKET_RECEIVED,
+  S_PACKET_SENT,
+  S_RX_PACKET_ERROR,
+  S_TX_PACKET_ERROR,
+  S_CALIBRATION_ERROR,
+  S_IDLE,
+} state_t;
+
+volatile bool tx_requested = false;
+volatile bool rx_requested = true;
+
+static volatile state_t state = S_IDLE;
+static volatile uint64_t error_code = 0;
+static volatile RAIL_Status_t calibration_status = 0;
+
+static __ALIGNED(RAIL_FIFO_ALIGNMENT) uint8_t rx_fifo[SL_FLEX_RAIL_RX_FIFO_SIZE];
+static __ALIGNED(RAIL_FIFO_ALIGNMENT) uint8_t tx_fifo[SL_FLEX_RAIL_TX_FIFO_SIZE];
+
+//  PAYLOAD
+static uint8_t out_packet[TX_PAYLOAD_LENGTH] = {
+  0x01, 0x16, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+  0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+};
+
+// Clé secrète
+static const uint8_t cle_entreprise[16] = {
+  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+  0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16
+};
+
+static uint32_t tx_counter = 0;
+static uint32_t rx_last_counter = 0;
+
+static volatile bool packet_recieved = false;
+static volatile bool packet_sent = false;
+static volatile bool rx_error = false;
+static volatile bool tx_error = false;
+static volatile bool cal_error = false;
+
+void printf_packet(const uint8_t * const rx_buffer, uint16_t length)
+{
+  #if defined(SL_CATALOG_APP_LOG_PRESENT)
+  if (rx_buffer == NULL) {
+    app_log_error("rx_buffer pointer is NULL!\n");
+  } else if (length == 0) {
+    app_log_error("packet length is zero!\n");
+  } else {
+    app_log_info("Packet reçu : ");
+    for (uint16_t i = 0; i < length; i++) {
+
+        app_log_info("0x%02X ", rx_buffer[i]);
+
+    }
+    app_log_info("\n");
+  }
+  #endif
+}
+
+static void build_nonce(uint8_t *nonce, uint32_t counter)
+{
+  memset(nonce, 0, CCM_NONCE_LEN);
+  nonce[0] = 0xDE;
+  nonce[1] = 0xAD;
+  nonce[2] = 0xBE;
+  nonce[3] = 0xEF;
+  memcpy(&nonce[4], &counter, sizeof(counter));
+}
+
+
+static bool encrypt_frame(uint8_t *frame)
+{
+  uint8_t nonce[CCM_NONCE_LEN];
+  uint32_t counter = tx_counter++;
+  sl_status_t status_se;
+
+  build_nonce(nonce, counter);
+  memcpy(frame, &counter, COUNTER_LEN);
+
+  sl_se_command_context_t cmd_ctx;
+  sl_se_init_command_context(&cmd_ctx);
+
+  sl_se_key_descriptor_t key_desc = {
+    .type = SL_SE_KEY_TYPE_AES_128,
+    .storage.method = SL_SE_KEY_STORAGE_EXTERNAL_PLAINTEXT,
+    .storage.location.buffer.pointer = (uint8_t *)cle_entreprise,
+    .storage.location.buffer.size = sizeof(cle_entreprise),
+  };
+
+  status_se = sl_se_ccm_encrypt_and_tag(&cmd_ctx,
+                                         &key_desc,
+                                         PLAINTEXT_LEN,
+                                         nonce, CCM_NONCE_LEN,
+                                         frame, COUNTER_LEN,
+                                         out_packet,
+                                         frame + COUNTER_LEN,
+                                         frame + COUNTER_LEN + PLAINTEXT_LEN,
+                                         CCM_TAG_LEN);
+
+  return (status_se == SL_STATUS_OK);
+}
+
+
+static bool decrypt_frame(const uint8_t *frame, uint8_t *plaintext_out)
+{
+  uint32_t counter;
+  memcpy(&counter, frame, COUNTER_LEN);
+
+  if (counter <= rx_last_counter && rx_last_counter != 0) {
+    app_log_warning("Trame rejetee : compteur rejoue (recu %lu, dernier %lu)\n",
+                     (unsigned long)counter, (unsigned long)rx_last_counter);
+    return false;
+  }
+
+  uint8_t nonce[CCM_NONCE_LEN];
+  build_nonce(nonce, counter);
+
+  sl_se_command_context_t cmd_ctx;
+  sl_se_init_command_context(&cmd_ctx);
+
+  sl_se_key_descriptor_t key_desc = {
+    .type = SL_SE_KEY_TYPE_AES_128,
+    .storage.method = SL_SE_KEY_STORAGE_EXTERNAL_PLAINTEXT,
+    .storage.location.buffer.pointer = (uint8_t *)cle_entreprise,
+    .storage.location.buffer.size = sizeof(cle_entreprise),
+  };
+
+  sl_status_t status_se = sl_se_ccm_auth_decrypt(&cmd_ctx,
+                                                  &key_desc,
+                                                  PLAINTEXT_LEN,
+                                                  nonce, CCM_NONCE_LEN,
+                                                  frame, COUNTER_LEN,
+                                                  frame + COUNTER_LEN,
+                                                  plaintext_out,
+                                                  frame + COUNTER_LEN + PLAINTEXT_LEN,
+                                                  CCM_TAG_LEN);
+
+  if (status_se != SL_STATUS_OK) {
+    return false;
+  }
+
+  rx_last_counter = counter;
+  return true;
+}
+
+
+void app_process_action(RAIL_Handle_t rail_handle)
+{
+  RAIL_RxPacketHandle_t rx_packet_handle;
+  RAIL_RxPacketInfo_t packet_info;
+  RAIL_Status_t rail_status = RAIL_STATUS_NO_ERROR;
+  RAIL_Status_t calibration_status_buff = RAIL_STATUS_NO_ERROR;
+  #if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
+  uint8_t success_sent = 0x01;
+  #endif
+
+  if (packet_recieved) {
+    packet_recieved = false;
+    state = S_PACKET_RECEIVED;
+  } else if (packet_sent) {
+    packet_sent = false;
+    state = S_PACKET_SENT;
+  } else if (rx_error) {
+    rx_error = false;
+    state = S_RX_PACKET_ERROR;
+  } else if (tx_error) {
+    tx_error = false;
+    state = S_TX_PACKET_ERROR;
+  } else if (cal_error) {
+    cal_error = false;
+    state = S_CALIBRATION_ERROR;
+  }
+
+  switch (state) {
+    case S_PACKET_RECEIVED:
+      rx_packet_handle = RAIL_GetRxPacketInfo(rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST_COMPLETE, &packet_info);
+      while (rx_packet_handle != RAIL_RX_PACKET_HANDLE_INVALID) {
+        uint8_t *start_of_packet = 0;
+        uint16_t packet_size = unpack_packet(rx_fifo, &packet_info, &start_of_packet);
+
+        if (packet_size > 0 && start_of_packet != NULL) {
+          if (packet_size == FRAME_LEN) {
+            uint8_t plaintext[PLAINTEXT_LEN];
+            printf_packet(start_of_packet, packet_size);
+            if (decrypt_frame(start_of_packet, plaintext)) {
+                app_log_info("Trame déchiffree est : ");
+               for (int i = 0; i < PLAINTEXT_LEN; i++) {
+                 app_log_info("%02X ", plaintext[i]);
+               }
+               app_log_info("\n");
+              if (plaintext[0] == 0x01) {
+                sl_led_toggle(&sl_led_led0);
+                sl_udelay_wait(500000U);
+                sl_led_toggle(&sl_led_led0);
+              }
+            } else {
+              app_log_error("Alerte securite : authentification AES-CCM echouee, trame rejetee !\n");
+            }
+          } else {
+            app_log_warning("Paquet ignore : taille incorrecte (%d au lieu de %d)\n",
+                             packet_size, FRAME_LEN);
+          }
+        }
+
+        rail_status = RAIL_ReleaseRxPacket(rail_handle, rx_packet_handle);
+        if (rail_status != RAIL_STATUS_NO_ERROR) {
+          app_log_warning("RAIL_ReleaseRxPacket() result:%d", rail_status);
+        }
+        if (rx_requested) {
+         // printf_rx_packet(start_of_packet, packet_size);
+#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
+          sl_rail_simple_cpc_transmit(packet_size, start_of_packet);
+#endif
+        }
+        rx_packet_handle = RAIL_GetRxPacketInfo(rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST_COMPLETE, &packet_info);
+      }
+      state = S_IDLE;
+      break;
+
+    case S_PACKET_SENT:
+      app_log_info("Packet has been sent\n");
+#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
+      sl_rail_simple_cpc_transmit(1, &success_sent);
+#endif
+      state = S_IDLE;
+      break;
+
+    case S_RX_PACKET_ERROR:
+      app_log_error("Radio RX Error occurred\nEvents: %llX\n", error_code);
+      state = S_IDLE;
+      break;
+
+    case S_TX_PACKET_ERROR:
+      app_log_error("Radio TX Error occurred\nEvents: %llX\n", error_code);
+      state = S_IDLE;
+      break;
+
+    case S_IDLE:
+      if (tx_requested) {
+        uint8_t frame[FRAME_LEN] = {0};
+
+        if (encrypt_frame(frame)) {
+          prepare_package(rail_handle, frame, FRAME_LEN);
+          rail_status = RAIL_StartTx(rail_handle, 1, RAIL_TX_OPTIONS_DEFAULT, NULL);
+          if (rail_status != RAIL_STATUS_NO_ERROR) {
+            app_log_warning("RAIL_StartTx() result:%d ", rail_status);
+          }
+        } else {
+          app_log_error("Erreur materielle AES-CCM (chiffrement)\n");
+        }
+        tx_requested = false;
+      }
+      break;
+
+    case S_CALIBRATION_ERROR:
+      calibration_status_buff = calibration_status;
+      app_log_error("Radio Calibration Error occurred\nEvents: %llX\nRAIL_Calibrate() result:%d\n",
+                    error_code,
+                    calibration_status_buff);
+      state = S_IDLE;
+      break;
+
+    default:
+      app_log_error("Unexpected Simple TRX state occurred:%d\n", state);
+      break;
+  }
+}
+
+void sl_rail_util_on_event(RAIL_Handle_t rail_handle, RAIL_Events_t events)
+{
+  error_code = events;
+  if ( events & RAIL_EVENTS_RX_COMPLETION ) {
+    if (events & RAIL_EVENT_RX_PACKET_RECEIVED) {
+      RAIL_HoldRxPacket(rail_handle);
+      packet_recieved = true;
+    } else {
+      rx_error = true;
+    }
+  }
+  if ( events & RAIL_EVENTS_TX_COMPLETION) {
+    if (events & RAIL_EVENT_TX_PACKET_SENT) {
+      packet_sent = true;
+    } else {
+      tx_error = true;
+    }
+  }
+
+  if ( events & RAIL_EVENT_CAL_NEEDED ) {
+    calibration_status = RAIL_Calibrate(rail_handle, NULL, RAIL_CAL_ALL_PENDING);
+    if (calibration_status != RAIL_STATUS_NO_ERROR) {
+      cal_error = true;
+    }
+  }
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+  app_task_notify();
+#endif
+}
+
+void sl_button_on_change(const sl_button_t *handle)
+{
+  if (sl_button_get_state(handle) == SL_SIMPLE_BUTTON_PRESSED) {
+    tx_requested = true;
+  }
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+  app_task_notify();
+#endif
+}
+
+#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
+void sl_rail_simple_cpc_receive_cb(sl_status_t status, uint32_t len, uint8_t *data)
+{
+  if (status == SL_STATUS_OK) {
+    if (len == 1) {
+      if (data[0] == 0x01 || data[0] == '1') {
+        tx_requested = true;
+      }
+      if (data[0] == 0x00 || data[0] == '0') {
+        rx_requested = !rx_requested;
+      }
+    }
+  }
+}
+#endif
+
+void set_up_tx_fifo(RAIL_Handle_t rail_handle)
+{
+  uint16_t allocated_tx_fifo_size = 0;
+  allocated_tx_fifo_size = RAIL_SetTxFifo(rail_handle, tx_fifo, 0, SL_FLEX_RAIL_TX_FIFO_SIZE);
+  app_assert(allocated_tx_fifo_size == SL_FLEX_RAIL_TX_FIFO_SIZE,
+             "RAIL_SetTxFifo() failed to allocate a large enough fifo (%d bytes instead of %d bytes)\n",
+             allocated_tx_fifo_size,
+             SL_FLEX_RAIL_TX_FIFO_SIZE);
+}
