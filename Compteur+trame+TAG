@@ -25,14 +25,15 @@
 #include "sl_rail_simple_cpc.h"
 #endif
 
-// -----------------------------------------------------------------------------
-//                              AES-CCM-96 config
-// -----------------------------------------------------------------------------
+
+#define CTRL_LEN        (1U)
 #define PLAINTEXT_LEN   (16U)
+#define INDEX_LEN       (2U)
 #define COUNTER_LEN     (4U)
 #define CCM_TAG_LEN     (12U)
+
+#define FRAME_LEN       (CTRL_LEN + PLAINTEXT_LEN + INDEX_LEN + COUNTER_LEN + CCM_TAG_LEN)
 #define CCM_NONCE_LEN   (13U)
-#define FRAME_LEN       (COUNTER_LEN + PLAINTEXT_LEN + CCM_TAG_LEN)
 
 #define TX_PAYLOAD_LENGTH (PLAINTEXT_LEN)
 
@@ -55,20 +56,21 @@ static volatile RAIL_Status_t calibration_status = 0;
 static __ALIGNED(RAIL_FIFO_ALIGNMENT) uint8_t rx_fifo[SL_FLEX_RAIL_RX_FIFO_SIZE];
 static __ALIGNED(RAIL_FIFO_ALIGNMENT) uint8_t tx_fifo[SL_FLEX_RAIL_TX_FIFO_SIZE];
 
-//  PAYLOAD
+// NOTRE data
 static uint8_t out_packet[TX_PAYLOAD_LENGTH] = {
   0x01, 0x16, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
   0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
 };
 
-// Clé secrète
+// CLÉ ENTREPRISE
 static const uint8_t cle_entreprise[16] = {
   0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
   0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16
 };
 
-static uint32_t tx_counter = 0;
-static uint32_t rx_last_counter = 0;
+static const uint16_t mon_index_carte = 0xAA55; // Index  de l'adresse émettrice
+static uint32_t tx_counter = 0;                  // Compteur (4 octets)
+static uint32_t rx_last_counter = 0;             // Mémoire du dernier compteur valide reçu
 
 static volatile bool packet_recieved = false;
 static volatile bool packet_sent = false;
@@ -84,36 +86,35 @@ void printf_packet(const uint8_t * const rx_buffer, uint16_t length)
   } else if (length == 0) {
     app_log_error("packet length is zero!\n");
   } else {
-    app_log_info("Packet reçu : ");
+      app_log_info("\n");
+    app_log_info("Trame brute reçue  : ");
     for (uint16_t i = 0; i < length; i++) {
-
-        app_log_info("0x%02X ", rx_buffer[i]);
-
+        app_log_info("%02X ", rx_buffer[i]);
     }
     app_log_info("\n");
   }
   #endif
 }
 
-static void build_nonce(uint8_t *nonce, uint32_t counter)
+static void build_nonce_ccm(uint8_t *nonce, uint16_t index, uint32_t counter)
 {
   memset(nonce, 0, CCM_NONCE_LEN);
-  nonce[0] = 0xDE;
-  nonce[1] = 0xAD;
-  nonce[2] = 0xBE;
-  nonce[3] = 0xEF;
-  memcpy(&nonce[4], &counter, sizeof(counter));
+  memcpy(nonce, &index, sizeof(index));
+  memcpy(&nonce[sizeof(index)], &counter, sizeof(counter));
 }
-
 
 static bool encrypt_frame(uint8_t *frame)
 {
   uint8_t nonce[CCM_NONCE_LEN];
-  uint32_t counter = tx_counter++;
+  uint32_t current_cpt = tx_counter++;
   sl_status_t status_se;
 
-  build_nonce(nonce, counter);
-  memcpy(frame, &counter, COUNTER_LEN);
+  build_nonce_ccm(nonce, mon_index_carte, current_cpt);
+
+  frame[0] = 0x0A; // la valeur de ctrl
+  memcpy(&frame[1 + PLAINTEXT_LEN], &mon_index_carte, INDEX_LEN); //le placement de index est à +17 octets
+  memcpy(&frame[1 + PLAINTEXT_LEN + INDEX_LEN], &current_cpt, COUNTER_LEN); //le placement de compteur est à +19 octets
+
 
   sl_se_command_context_t cmd_ctx;
   sl_se_init_command_context(&cmd_ctx);
@@ -126,32 +127,33 @@ static bool encrypt_frame(uint8_t *frame)
   };
 
   status_se = sl_se_ccm_encrypt_and_tag(&cmd_ctx,
-                                         &key_desc,
-                                         PLAINTEXT_LEN,
+                                         &key_desc, PLAINTEXT_LEN, //notre cle avec sa taille
                                          nonce, CCM_NONCE_LEN,
-                                         frame, COUNTER_LEN,
-                                         out_packet,
-                                         frame + COUNTER_LEN,
-                                         frame + COUNTER_LEN + PLAINTEXT_LEN,
-                                         CCM_TAG_LEN);
+                                         frame, (CTRL_LEN),//
+                                         out_packet, // notre data à coder 16 octets
+                                         frame + 1, // le placement de debut de data
+                                         frame + (CTRL_LEN + PLAINTEXT_LEN + INDEX_LEN + COUNTER_LEN) , CCM_TAG_LEN); //le placement de notre signature TAG
+
 
   return (status_se == SL_STATUS_OK);
 }
 
-
 static bool decrypt_frame(const uint8_t *frame, uint8_t *plaintext_out)
 {
-  uint32_t counter;
-  memcpy(&counter, frame, COUNTER_LEN);
+  uint16_t index_recu;
+  uint32_t compteur_recu;
 
-  if (counter <= rx_last_counter && rx_last_counter != 0) {
-    app_log_warning("Trame rejetee : compteur rejoue (recu %lu, dernier %lu)\n",
-                     (unsigned long)counter, (unsigned long)rx_last_counter);
+
+  memcpy(&index_recu, &frame[1 + PLAINTEXT_LEN], INDEX_LEN);
+  memcpy(&compteur_recu, &frame[1 + PLAINTEXT_LEN + INDEX_LEN], COUNTER_LEN);
+
+  if (compteur_recu <= rx_last_counter && rx_last_counter != 0) {
+    app_log_warning("Alerte Sécurité : Compteur rejoué ! \n");
     return false;
   }
 
   uint8_t nonce[CCM_NONCE_LEN];
-  build_nonce(nonce, counter);
+  build_nonce_ccm(nonce, index_recu, compteur_recu);
 
   sl_se_command_context_t cmd_ctx;
   sl_se_init_command_context(&cmd_ctx);
@@ -167,30 +169,24 @@ static bool decrypt_frame(const uint8_t *frame, uint8_t *plaintext_out)
                                                   &key_desc,
                                                   PLAINTEXT_LEN,
                                                   nonce, CCM_NONCE_LEN,
-                                                  frame, COUNTER_LEN,
-                                                  frame + COUNTER_LEN,
+                                                  frame, (CTRL_LEN ),
+                                                  frame + 1,
                                                   plaintext_out,
-                                                  frame + COUNTER_LEN + PLAINTEXT_LEN,
-                                                  CCM_TAG_LEN);
+                                                  frame + (CTRL_LEN + PLAINTEXT_LEN + INDEX_LEN + COUNTER_LEN) ,CCM_TAG_LEN);
 
   if (status_se != SL_STATUS_OK) {
     return false;
   }
 
-  rx_last_counter = counter;
+  rx_last_counter = compteur_recu;
   return true;
 }
-
 
 void app_process_action(RAIL_Handle_t rail_handle)
 {
   RAIL_RxPacketHandle_t rx_packet_handle;
   RAIL_RxPacketInfo_t packet_info;
   RAIL_Status_t rail_status = RAIL_STATUS_NO_ERROR;
-  RAIL_Status_t calibration_status_buff = RAIL_STATUS_NO_ERROR;
-  #if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
-  uint8_t success_sent = 0x01;
-  #endif
 
   if (packet_recieved) {
     packet_recieved = false;
@@ -219,23 +215,26 @@ void app_process_action(RAIL_Handle_t rail_handle)
         if (packet_size > 0 && start_of_packet != NULL) {
           if (packet_size == FRAME_LEN) {
             uint8_t plaintext[PLAINTEXT_LEN];
+
             printf_packet(start_of_packet, packet_size);
+
             if (decrypt_frame(start_of_packet, plaintext)) {
-                app_log_info("Trame déchiffree est : ");
+               app_log_info("Trame déchiffree : ");
                for (int i = 0; i < PLAINTEXT_LEN; i++) {
                  app_log_info("%02X ", plaintext[i]);
                }
                app_log_info("\n");
-              if (plaintext[0] == 0x01) {
+
+               if (start_of_packet[0] == 0x0A && plaintext[0] == 0x01) {
                 sl_led_toggle(&sl_led_led0);
-                sl_udelay_wait(500000U);
-                sl_led_toggle(&sl_led_led0);
+               // sl_udelay_wait(500000U);
+               // sl_led_toggle(&sl_led_led0);
               }
             } else {
-              app_log_error("Alerte securite : authentification AES-CCM echouee, trame rejetee !\n");
+              app_log_error("Alerte Sécurité : Signature ou Clé invalide, trame corrompue rejetée !\n");
             }
           } else {
-            app_log_warning("Paquet ignore : taille incorrecte (%d au lieu de %d)\n",
+            app_log_warning("Paquet ignoré : Taille incorrecte (%d octets reçus au lieu de %d)\n",
                              packet_size, FRAME_LEN);
           }
         }
@@ -244,22 +243,13 @@ void app_process_action(RAIL_Handle_t rail_handle)
         if (rail_status != RAIL_STATUS_NO_ERROR) {
           app_log_warning("RAIL_ReleaseRxPacket() result:%d", rail_status);
         }
-        if (rx_requested) {
-         // printf_rx_packet(start_of_packet, packet_size);
-#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
-          sl_rail_simple_cpc_transmit(packet_size, start_of_packet);
-#endif
-        }
         rx_packet_handle = RAIL_GetRxPacketInfo(rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST_COMPLETE, &packet_info);
       }
       state = S_IDLE;
       break;
 
     case S_PACKET_SENT:
-      app_log_info("Packet has been sent\n");
-#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
-      sl_rail_simple_cpc_transmit(1, &success_sent);
-#endif
+      app_log_info("Packet has been sent successfully\n");
       state = S_IDLE;
       break;
 
@@ -275,26 +265,23 @@ void app_process_action(RAIL_Handle_t rail_handle)
 
     case S_IDLE:
       if (tx_requested) {
-        uint8_t frame[FRAME_LEN] = {0};
+        uint8_t frame_buffer[FRAME_LEN] = { 0 };
 
-        if (encrypt_frame(frame)) {
-          prepare_package(rail_handle, frame, FRAME_LEN);
+        if (encrypt_frame(frame_buffer)) {
+          prepare_package(rail_handle, frame_buffer, FRAME_LEN);
           rail_status = RAIL_StartTx(rail_handle, 1, RAIL_TX_OPTIONS_DEFAULT, NULL);
           if (rail_status != RAIL_STATUS_NO_ERROR) {
             app_log_warning("RAIL_StartTx() result:%d ", rail_status);
           }
         } else {
-          app_log_error("Erreur materielle AES-CCM (chiffrement)\n");
+          app_log_error("Erreur critique : Échec de la sécurisation matérielle\n");
         }
         tx_requested = false;
       }
       break;
 
     case S_CALIBRATION_ERROR:
-      calibration_status_buff = calibration_status;
-      app_log_error("Radio Calibration Error occurred\nEvents: %llX\nRAIL_Calibrate() result:%d\n",
-                    error_code,
-                    calibration_status_buff);
+      app_log_error("Radio Calibration Error occurred\nEvents: %llX\n", error_code);
       state = S_IDLE;
       break;
 
@@ -344,22 +331,6 @@ void sl_button_on_change(const sl_button_t *handle)
 #endif
 }
 
-#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
-void sl_rail_simple_cpc_receive_cb(sl_status_t status, uint32_t len, uint8_t *data)
-{
-  if (status == SL_STATUS_OK) {
-    if (len == 1) {
-      if (data[0] == 0x01 || data[0] == '1') {
-        tx_requested = true;
-      }
-      if (data[0] == 0x00 || data[0] == '0') {
-        rx_requested = !rx_requested;
-      }
-    }
-  }
-}
-#endif
-
 void set_up_tx_fifo(RAIL_Handle_t rail_handle)
 {
   uint16_t allocated_tx_fifo_size = 0;
@@ -369,3 +340,4 @@ void set_up_tx_fifo(RAIL_Handle_t rail_handle)
              allocated_tx_fifo_size,
              SL_FLEX_RAIL_TX_FIFO_SIZE);
 }
+
