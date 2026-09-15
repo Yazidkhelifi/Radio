@@ -1,0 +1,241 @@
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+#include "sl_component_catalog.h"
+#include "simple_rail_assistance.h"
+#include "rail.h"
+#include "app_process.h"
+#include "sl_simple_button_instances.h"
+#include "sl_simple_led_instances.h"
+#include "sl_flex_rail_package_assistant.h"
+#include "sl_flex_rail_config.h"
+#include "sl_flex_rail_channel_selector.h"
+#include "sl_sleeptimer.h"
+#include "sl_udelay.h"
+
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+#include "app_task_init.h"
+#endif
+
+#include "rail_types.h"
+#include "cmsis_compiler.h"
+
+#if defined(SL_CATALOG_RAIL_SIMPLE_CPC_PRESENT)
+#include "sl_rail_simple_cpc.h"
+#endif
+
+
+#define FRAME_LEN       (21U)
+#define TX_PAYLOAD_LENGTH (FRAME_LEN)
+
+typedef enum {
+  S_PACKET_RECEIVED,
+  S_PACKET_SENT,
+  S_RX_PACKET_ERROR,
+  S_TX_PACKET_ERROR,
+  S_CALIBRATION_ERROR,
+  S_IDLE,
+} state_t;
+
+volatile bool tx_requested = false;
+volatile bool rx_requested = true;
+
+static volatile state_t state = S_IDLE;
+static volatile uint64_t error_code = 0;
+static volatile RAIL_Status_t calibration_status = 0;
+
+static __ALIGNED(RAIL_FIFO_ALIGNMENT) uint8_t rx_fifo[SL_FLEX_RAIL_RX_FIFO_SIZE];
+static __ALIGNED(RAIL_FIFO_ALIGNMENT) uint8_t tx_fifo[SL_FLEX_RAIL_TX_FIFO_SIZE];
+
+
+
+static uint8_t out_packet[TX_PAYLOAD_LENGTH] = {
+  0x7D, 0x4D, 0x4D,                               // Start Gap + DC
+  0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+  0x35, 0x35,                                     // Commande active d'allumage
+  0x55, 0x54                                      // End Chips
+};
+
+static volatile bool packet_recieved = false;
+static volatile bool packet_sent = false;
+static volatile bool rx_error = false;
+static volatile bool tx_error = false;
+static volatile bool cal_error = false;
+void printf_packet(const uint8_t * const rx_buffer, uint16_t length)
+{
+  #if defined(SL_CATALOG_APP_LOG_PRESENT)
+  if (rx_buffer == NULL) {
+    app_log_error("rx_buffer pointer is NULL!\n");
+  } else if (length == 0) {
+    app_log_error("packet length is zero!\n");
+  } else {
+    app_log_info("\nTrame brute détectée (21 octets) : ");
+    for (uint16_t i = 0; i < length; i++) {
+        app_log_info("%02X ", rx_buffer[i]);
+    }
+    app_log_info("\n");
+  }
+  #endif
+}
+
+void app_process_action(RAIL_Handle_t rail_handle)
+{
+  RAIL_RxPacketHandle_t rx_packet_handle;
+  RAIL_RxPacketInfo_t packet_info;
+  RAIL_Status_t rail_status = RAIL_STATUS_NO_ERROR;
+
+  if (packet_recieved) {
+    packet_recieved = false;
+    state = S_PACKET_RECEIVED;
+  } else if (packet_sent) {
+    packet_sent = false;
+    state = S_PACKET_SENT;
+  } else if (rx_error) {
+    rx_error = false;
+    state = S_RX_PACKET_ERROR;
+  } else if (tx_error) {
+    tx_error = false;
+    state = S_TX_PACKET_ERROR;
+  } else if (cal_error) {
+    cal_error = false;
+    state = S_CALIBRATION_ERROR;
+  }
+
+  switch (state) {
+    case S_PACKET_RECEIVED:
+      rx_packet_handle = RAIL_GetRxPacketInfo(rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST_COMPLETE, &packet_info);
+      while (rx_packet_handle != RAIL_RX_PACKET_HANDLE_INVALID) {
+        uint8_t *start_of_packet = 0;
+        uint16_t packet_size = unpack_packet(rx_fifo, &packet_info, &start_of_packet);
+
+        if (packet_size > 0 && start_of_packet != NULL) {
+          if (packet_size == FRAME_LEN) {
+
+            printf_packet(start_of_packet, packet_size);
+
+            bool structure_physique_ok = false;
+            bool commande_allumage_valide = false;
+
+            if (start_of_packet[19] == 0x55 && start_of_packet[20] == 0x54) {
+              structure_physique_ok = true;
+            }
+
+
+          //  for (int i = 0; i < 20; i++) {
+              if (start_of_packet[17] == 0x35 && start_of_packet[18] == 0x35) {
+                commande_allumage_valide = true;
+              //  break;
+              }
+            //}
+
+            if (commande_allumage_valide && structure_physique_ok) {
+              app_log_info("-> [VALIDÉ] : GBF ou EFR32 compatible détecté. Allumage LED.\n");
+              sl_led_toggle(&sl_led_led0);
+
+            } else if (commande_allumage_valide && !structure_physique_ok) {
+              app_log_warning("-> [REJETÉ] Commande 0x35 trouvée mais motifs End Chips absents (Faux émetteur).\n");
+            } else {
+              app_log_warning("-> Trame lue mais aucune commande d'allumage 0x35 à l'intérieur.\n");
+            }
+
+          } else {
+            app_log_warning("Paquet ignoré : Taille invalide (%d octets au lieu de %d)\n",
+                             packet_size, FRAME_LEN);
+          }
+        }
+
+        rail_status = RAIL_ReleaseRxPacket(rail_handle, rx_packet_handle);
+        if (rail_status != RAIL_STATUS_NO_ERROR) {
+          app_log_warning("RAIL_ReleaseRxPacket() result:%d", rail_status);
+        }
+        rx_packet_handle = RAIL_GetRxPacketInfo(rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST_COMPLETE, &packet_info);
+      }
+      state = S_IDLE;
+      break;
+
+    case S_PACKET_SENT:
+      app_log_info("Packet has been sent successfully\n");
+      state = S_IDLE;
+      break;
+
+    case S_RX_PACKET_ERROR:
+      app_log_error("Radio RX Error occurred\nEvents: %llX\n", error_code);
+      state = S_IDLE;
+      break;
+
+    case S_TX_PACKET_ERROR:
+      app_log_error("Radio TX Error occurred\nEvents: %llX\n", error_code);
+      state = S_IDLE;
+      break;
+
+    case S_IDLE:
+      if (tx_requested) {
+        prepare_package(rail_handle, out_packet, FRAME_LEN);
+        rail_status = RAIL_StartTx(rail_handle, 1, RAIL_TX_OPTIONS_DEFAULT, NULL);
+        if (rail_status != RAIL_STATUS_NO_ERROR) {
+          app_log_warning("RAIL_StartTx() result:%d ", rail_status);
+        }
+        tx_requested = false;
+      }
+      break;
+
+    case S_CALIBRATION_ERROR:
+      app_log_error("Radio Calibration Error occurred\nEvents: %llX\n", error_code);
+      state = S_IDLE;
+      break;
+
+    default:
+      app_log_error("Unexpected Simple TRX state occurred:%d\n", state);
+      break;
+  }
+}
+
+void sl_rail_util_on_event(RAIL_Handle_t rail_handle, RAIL_Events_t events)
+{
+  error_code = events;
+  if ( events & RAIL_EVENTS_RX_COMPLETION ) {
+    if (events & RAIL_EVENT_RX_PACKET_RECEIVED) {
+      RAIL_HoldRxPacket(rail_handle);
+      packet_recieved = true;
+    } else {
+      rx_error = true;
+    }
+  }
+  if ( events & RAIL_EVENTS_TX_COMPLETION) {
+    if (events & RAIL_EVENT_TX_PACKET_SENT) {
+      packet_sent = true;
+    } else {
+      tx_error = true;
+    }
+  }
+
+  if ( events & RAIL_EVENT_CAL_NEEDED ) {
+    calibration_status = RAIL_Calibrate(rail_handle, NULL, RAIL_CAL_ALL_PENDING);
+    if (calibration_status != RAIL_STATUS_NO_ERROR) {
+      cal_error = true;
+    }
+  }
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+  app_task_notify();
+#endif
+}
+
+void sl_button_on_change(const sl_button_t *handle)
+{
+  if (sl_button_get_state(handle) == SL_SIMPLE_BUTTON_PRESSED) {
+    tx_requested = true;
+  }
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+  app_task_notify();
+#endif
+}
+
+void set_up_tx_fifo(RAIL_Handle_t rail_handle)
+{
+  uint16_t allocated_tx_fifo_size = 0;
+  allocated_tx_fifo_size = RAIL_SetTxFifo(rail_handle, tx_fifo, 0, SL_FLEX_RAIL_TX_FIFO_SIZE);
+  app_assert(allocated_tx_fifo_size == SL_FLEX_RAIL_TX_FIFO_SIZE,
+             "RAIL_SetTxFifo() failed to allocate a large enough fifo (%d bytes instead of %d bytes)\n",
+             allocated_tx_fifo_size,
+             SL_FLEX_RAIL_TX_FIFO_SIZE);
+}
